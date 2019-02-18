@@ -1,21 +1,30 @@
-import React from 'react';
-import PropTypes from 'prop-types';
-import { Layout, Menu, Icon, Avatar, Dropdown, Tag, message, Spin } from 'antd';
+import React, { Suspense } from 'react';
+import { Layout } from 'antd';
 import DocumentTitle from 'react-document-title';
+import isEqual from 'lodash/isEqual';
+import memoizeOne from 'memoize-one';
 import { connect } from 'dva';
-import { Link, Route, Redirect, Switch } from 'dva/router';
-import moment from 'moment';
-import groupBy from 'lodash/groupBy';
 import { ContainerQuery } from 'react-container-query';
 import classNames from 'classnames';
-import HeaderSearch from '../components/HeaderSearch';
-import NoticeIcon from '../components/NoticeIcon';
-import GlobalFooter from '../components/GlobalFooter';
-import NotFound from '../routes/Exception/404';
+import pathToRegexp from 'path-to-regexp';
+import Media from 'react-media';
+import { formatMessage } from 'umi/locale';
+import Authorized from '@/utils/Authorized';
+import logo from '../assets/logo.svg';
+import Footer from './Footer';
+import Header from './Header';
+import Context from './MenuContext';
+import Exception403 from '../pages/Exception/403';
+import PageLoading from '@/components/PageLoading';
+import SiderMenu from '@/components/SiderMenu';
+import { menu, title } from '../defaultSettings';
+
 import styles from './BasicLayout.less';
 
-const { Header, Sider, Content } = Layout;
-const { SubMenu } = Menu;
+// lazy load SettingDrawer
+const SettingDrawer = React.lazy(() => import('@/components/SettingDrawer'));
+
+const { Content } = Layout;
 
 const query = {
   'screen-xs': {
@@ -35,367 +44,191 @@ const query = {
   },
   'screen-xl': {
     minWidth: 1200,
+    maxWidth: 1599,
+  },
+  'screen-xxl': {
+    minWidth: 1600,
   },
 };
 
-class BasicLayout extends React.PureComponent {
-  static childContextTypes = {
-    location: PropTypes.object,
-    breadcrumbNameMap: PropTypes.object,
-  }
+class BasicLayout extends React.Component {
   constructor(props) {
     super(props);
-    // 把一级 Layout 的 children 作为菜单项
-    this.menus = props.navData.reduce((arr, current) => arr.concat(current.children), []);
-    this.state = {
-      openKeys: this.getDefaultCollapsedSubMenus(props),
-    };
+    this.getPageTitle = memoizeOne(this.getPageTitle);
+    this.matchParamsPath = memoizeOne(this.matchParamsPath, isEqual);
   }
-  getChildContext() {
-    const { location, navData, getRouteData } = this.props;
-    const routeData = getRouteData('BasicLayout');
-    const firstMenuData = navData.reduce((arr, current) => arr.concat(current.children), []);
-    const menuData = this.getMenuData(firstMenuData, '');
-    const breadcrumbNameMap = {};
 
-    routeData.concat(menuData).forEach((item) => {
-      breadcrumbNameMap[item.path] = item.name;
-    });
-    return { location, breadcrumbNameMap };
-  }
   componentDidMount() {
-    this.props.dispatch({
+    const {
+      dispatch,
+      route: { routes, authority },
+    } = this.props;
+    dispatch({
       type: 'user/fetchCurrent',
     });
+    dispatch({
+      type: 'setting/getSetting',
+    });
+    dispatch({
+      type: 'menu/getMenuData',
+      payload: { routes, authority },
+    });
   }
-  componentWillUnmount() {
-    clearTimeout(this.resizeTimeout);
+
+  getContext() {
+    const { location, breadcrumbNameMap } = this.props;
+    return {
+      location,
+      breadcrumbNameMap,
+    };
   }
-  onCollapse = (collapsed) => {
-    this.props.dispatch({
+
+  matchParamsPath = (pathname, breadcrumbNameMap) => {
+    const pathKey = Object.keys(breadcrumbNameMap).find(key => pathToRegexp(key).test(pathname));
+    return breadcrumbNameMap[pathKey];
+  };
+
+  getRouteAuthority = (pathname, routeData) => {
+    const routes = routeData.slice(); // clone
+
+    const getAuthority = (routeDatas, path) => {
+      let authorities;
+      routeDatas.forEach(route => {
+        // check partial route
+        if (pathToRegexp(`${route.path}(.*)`).test(path)) {
+          if (route.authority) {
+            authorities = route.authority;
+          }
+          // is exact route?
+          if (!pathToRegexp(route.path).test(path) && route.routes) {
+            authorities = getAuthority(route.routes, path);
+          }
+        }
+      });
+      return authorities;
+    };
+
+    return getAuthority(routes, pathname);
+  };
+
+  getPageTitle = (pathname, breadcrumbNameMap) => {
+    const currRouterData = this.matchParamsPath(pathname, breadcrumbNameMap);
+
+    if (!currRouterData) {
+      return title;
+    }
+    const pageName = menu.disableLocal
+      ? currRouterData.name
+      : formatMessage({
+          id: currRouterData.locale || currRouterData.name,
+          defaultMessage: currRouterData.name,
+        });
+
+    return `${pageName} - ${title}`;
+  };
+
+  getLayoutStyle = () => {
+    const { fixSiderbar, isMobile, collapsed, layout } = this.props;
+    if (fixSiderbar && layout !== 'topmenu' && !isMobile) {
+      return {
+        paddingLeft: collapsed ? '80px' : '256px',
+      };
+    }
+    return null;
+  };
+
+  handleMenuCollapse = collapsed => {
+    const { dispatch } = this.props;
+    dispatch({
       type: 'global/changeLayoutCollapsed',
       payload: collapsed,
     });
-  }
-  onMenuClick = ({ key }) => {
-    if (key === 'logout') {
-      this.props.dispatch({
-        type: 'login/logout',
-      });
+  };
+
+  renderSettingDrawer = () => {
+    // Do not render SettingDrawer in production
+    // unless it is deployed in preview.pro.ant.design as demo
+    if (process.env.NODE_ENV === 'production' && APP_TYPE !== 'site') {
+      return null;
     }
-  }
-  getMenuData = (data, parentPath) => {
-    let arr = [];
-    data.forEach((item) => {
-      if (item.children) {
-        arr.push({ path: `${parentPath}/${item.path}`, name: item.name });
-        arr = arr.concat(this.getMenuData(item.children, `${parentPath}/${item.path}`));
-      }
-    });
-    return arr;
-  }
-  getDefaultCollapsedSubMenus(props) {
-    const currentMenuSelectedKeys = [...this.getCurrentMenuSelectedKeys(props)];
-    currentMenuSelectedKeys.splice(-1, 1);
-    if (currentMenuSelectedKeys.length === 0) {
-      return ['dashboard'];
-    }
-    return currentMenuSelectedKeys;
-  }
-  getCurrentMenuSelectedKeys(props) {
-    const { location: { pathname } } = props || this.props;
-    const keys = pathname.split('/').slice(1);
-    if (keys.length === 1 && keys[0] === '') {
-      return [this.menus[0].key];
-    }
-    return keys;
-  }
-  getNavMenuItems(menusData, parentPath = '') {
-    if (!menusData) {
-      return [];
-    }
-    return menusData.map((item) => {
-      if (!item.name) {
-        return null;
-      }
-      let itemPath;
-      if (item.path.indexOf('http') === 0) {
-        itemPath = item.path;
-      } else {
-        itemPath = `${parentPath}/${item.path || ''}`.replace(/\/+/g, '/');
-      }
-      if (item.children && item.children.some(child => child.name)) {
-        return (
-          <SubMenu
-            title={
-              item.icon ? (
-                <span>
-                  <Icon type={item.icon} />
-                  <span>{item.name}</span>
-                </span>
-              ) : item.name
-            }
-            key={item.key || item.path}
-          >
-            {this.getNavMenuItems(item.children, itemPath)}
-          </SubMenu>
-        );
-      }
-      const icon = item.icon && <Icon type={item.icon} />;
-      return (
-        <Menu.Item key={item.key || item.path}>
-          {
-            /^https?:\/\//.test(itemPath) ? (
-              <a href={itemPath} target={item.target}>
-                {icon}<span>{item.name}</span>
-              </a>
-            ) : (
-              <Link
-                to={itemPath}
-                target={item.target}
-                replace={itemPath === this.props.location.pathname}
-              >
-                {icon}<span>{item.name}</span>
-              </Link>
-            )
-          }
-        </Menu.Item>
-      );
-    });
-  }
-  getPageTitle() {
-    const { location, getRouteData } = this.props;
-    const { pathname } = location;
-    let title = 'Ant Design Pro';
-    getRouteData('BasicLayout').forEach((item) => {
-      if (item.path === pathname) {
-        title = `${item.name} - Ant Design Pro`;
-      }
-    });
-    return title;
-  }
-  getNoticeData() {
-    const { notices = [] } = this.props;
-    if (notices.length === 0) {
-      return {};
-    }
-    const newNotices = notices.map((notice) => {
-      const newNotice = { ...notice };
-      if (newNotice.datetime) {
-        newNotice.datetime = moment(notice.datetime).fromNow();
-      }
-      // transform id to item key
-      if (newNotice.id) {
-        newNotice.key = newNotice.id;
-      }
-      if (newNotice.extra && newNotice.status) {
-        const color = ({
-          todo: '',
-          processing: 'blue',
-          urgent: 'red',
-          doing: 'gold',
-        })[newNotice.status];
-        newNotice.extra = <Tag color={color} style={{ marginRight: 0 }}>{newNotice.extra}</Tag>;
-      }
-      return newNotice;
-    });
-    return groupBy(newNotices, 'type');
-  }
-  handleOpenChange = (openKeys) => {
-    const lastOpenKey = openKeys[openKeys.length - 1];
-    const isMainMenu = this.menus.some(
-      item => lastOpenKey && (item.key === lastOpenKey || item.path === lastOpenKey)
-    );
-    this.setState({
-      openKeys: isMainMenu ? [lastOpenKey] : [...openKeys],
-    });
-  }
-  toggle = () => {
-    const { collapsed } = this.props;
-    this.props.dispatch({
-      type: 'global/changeLayoutCollapsed',
-      payload: !collapsed,
-    });
-    this.resizeTimeout = setTimeout(() => {
-      const event = document.createEvent('HTMLEvents');
-      event.initEvent('resize', true, false);
-      window.dispatchEvent(event);
-    }, 600);
-  }
-  handleNoticeClear = (type) => {
-    message.success(`清空了${type}`);
-    this.props.dispatch({
-      type: 'global/clearNotices',
-      payload: type,
-    });
-  }
-  handleNoticeVisibleChange = (visible) => {
-    if (visible) {
-      this.props.dispatch({
-        type: 'global/fetchNotices',
-      });
-    }
-  }
+    return <SettingDrawer />;
+  };
+
   render() {
-    const { currentUser, collapsed, fetchingNotices, getRouteData } = this.props;
+    const {
+      navTheme,
+      layout: PropsLayout,
+      children,
+      location: { pathname },
+      isMobile,
+      menuData,
+      breadcrumbNameMap,
+      route: { routes },
+      fixedHeader,
+    } = this.props;
 
-    const menu = (
-      <Menu className={styles.menu} selectedKeys={[]} onClick={this.onMenuClick}>
-        <Menu.Item disabled><Icon type="user" />个人中心</Menu.Item>
-        <Menu.Item disabled><Icon type="setting" />设置</Menu.Item>
-        <Menu.Divider />
-        <Menu.Item key="logout"><Icon type="logout" />退出登录</Menu.Item>
-      </Menu>
-    );
-    const noticeData = this.getNoticeData();
-
-    // Don't show popup menu when it is been collapsed
-    const menuProps = collapsed ? {} : {
-      openKeys: this.state.openKeys,
-    };
-
+    const isTop = PropsLayout === 'topmenu';
+    const routerConfig = this.getRouteAuthority(pathname, routes);
+    const contentStyle = !fixedHeader ? { paddingTop: 0 } : {};
     const layout = (
       <Layout>
-        <Sider
-          trigger={null}
-          collapsible
-          collapsed={collapsed}
-          breakpoint="md"
-          onCollapse={this.onCollapse}
-          width={256}
-          className={styles.sider}
+        {isTop && !isMobile ? null : (
+          <SiderMenu
+            logo={logo}
+            theme={navTheme}
+            onCollapse={this.handleMenuCollapse}
+            menuData={menuData}
+            isMobile={isMobile}
+            {...this.props}
+          />
+        )}
+        <Layout
+          style={{
+            ...this.getLayoutStyle(),
+            minHeight: '100vh',
+          }}
         >
-          <div className={styles.logo}>
-            <Link to="/">
-              <img src="https://gw.alipayobjects.com/zos/rmsportal/iwWyPinUoseUxIAeElSx.svg" alt="logo" />
-              <h1>Ant Design Pro</h1>
-            </Link>
-          </div>
-          <Menu
-            theme="dark"
-            mode="inline"
-            {...menuProps}
-            onOpenChange={this.handleOpenChange}
-            selectedKeys={this.getCurrentMenuSelectedKeys()}
-            style={{ margin: '16px 0', width: '100%' }}
-          >
-            {this.getNavMenuItems(this.menus)}
-          </Menu>
-        </Sider>
-        <Layout>
-          <Header className={styles.header}>
-            <Icon
-              className={styles.trigger}
-              type={collapsed ? 'menu-unfold' : 'menu-fold'}
-              onClick={this.toggle}
-            />
-            <div className={styles.right}>
-              <HeaderSearch
-                className={`${styles.action} ${styles.search}`}
-                placeholder="站内搜索"
-                dataSource={['搜索提示一', '搜索提示二', '搜索提示三']}
-                onSearch={(value) => {
-                  console.log('input', value); // eslint-disable-line
-                }}
-                onPressEnter={(value) => {
-                  console.log('enter', value); // eslint-disable-line
-                }}
-              />
-              <NoticeIcon
-                className={styles.action}
-                count={currentUser.notifyCount}
-                onItemClick={(item, tabProps) => {
-                  console.log(item, tabProps); // eslint-disable-line
-                }}
-                onClear={this.handleNoticeClear}
-                onPopupVisibleChange={this.handleNoticeVisibleChange}
-                loading={fetchingNotices}
-                popupAlign={{ offset: [20, -16] }}
-              >
-                <NoticeIcon.Tab
-                  list={noticeData['通知']}
-                  title="通知"
-                  emptyText="你已查看所有通知"
-                  emptyImage="https://gw.alipayobjects.com/zos/rmsportal/wAhyIChODzsoKIOBHcBk.svg"
-                />
-                <NoticeIcon.Tab
-                  list={noticeData['消息']}
-                  title="消息"
-                  emptyText="您已读完所有消息"
-                  emptyImage="https://gw.alipayobjects.com/zos/rmsportal/sAuJeJzSKbUmHfBQRzmZ.svg"
-                />
-                <NoticeIcon.Tab
-                  list={noticeData['待办']}
-                  title="待办"
-                  emptyText="你已完成所有待办"
-                  emptyImage="https://gw.alipayobjects.com/zos/rmsportal/HsIsxMZiWKrNUavQUXqx.svg"
-                />
-              </NoticeIcon>
-              {currentUser.name ? (
-                <Dropdown overlay={menu}>
-                  <span className={`${styles.action} ${styles.account}`}>
-                    <Avatar size="small" className={styles.avatar} src={currentUser.avatar} />
-                    {currentUser.name}
-                  </span>
-                </Dropdown>
-              ) : <Spin size="small" style={{ marginLeft: 8 }} />}
-            </div>
-          </Header>
-          <Content style={{ margin: '24px 24px 0', height: '100%' }}>
-            <Switch>
-              {
-                getRouteData('BasicLayout').map(item =>
-                  (
-                    <Route
-                      exact={item.exact}
-                      key={item.path}
-                      path={item.path}
-                      component={item.component}
-                    />
-                  )
-                )
-              }
-              <Redirect exact from="/" to="/dashboard/analysis" />
-              <Route component={NotFound} />
-            </Switch>
-            <GlobalFooter
-              links={[{
-                title: 'Pro 首页',
-                href: 'http://pro.ant.design',
-                blankTarget: true,
-              }, {
-                title: 'GitHub',
-                href: 'https://github.com/ant-design/ant-design-pro',
-                blankTarget: true,
-              }, {
-                title: 'Ant Design',
-                href: 'http://ant.design',
-                blankTarget: true,
-              }]}
-              copyright={
-                <div>
-                  Copyright <Icon type="copyright" /> 2017 蚂蚁金服体验技术部出品
-                </div>
-              }
-            />
+          <Header
+            menuData={menuData}
+            handleMenuCollapse={this.handleMenuCollapse}
+            logo={logo}
+            isMobile={isMobile}
+            {...this.props}
+          />
+          <Content className={styles.content} style={contentStyle}>
+            <Authorized authority={routerConfig} noMatch={<Exception403 />}>
+              {children}
+            </Authorized>
           </Content>
+          <Footer />
         </Layout>
       </Layout>
     );
-
     return (
-      <DocumentTitle title={this.getPageTitle()}>
-        <ContainerQuery query={query}>
-          {params => <div className={classNames(params)}>{layout}</div>}
-        </ContainerQuery>
-      </DocumentTitle>
+      <React.Fragment>
+        <DocumentTitle title={this.getPageTitle(pathname, breadcrumbNameMap)}>
+          <ContainerQuery query={query}>
+            {params => (
+              <Context.Provider value={this.getContext()}>
+                <div className={classNames(params)}>{layout}</div>
+              </Context.Provider>
+            )}
+          </ContainerQuery>
+        </DocumentTitle>
+        <Suspense fallback={<PageLoading />}>{this.renderSettingDrawer()}</Suspense>
+      </React.Fragment>
     );
   }
 }
 
-export default connect(state => ({
-  currentUser: state.user.currentUser,
-  collapsed: state.global.collapsed,
-  fetchingNotices: state.global.fetchingNotices,
-  notices: state.global.notices,
-}))(BasicLayout);
+export default connect(({ global, setting, menu: menuModel }) => ({
+  collapsed: global.collapsed,
+  layout: setting.layout,
+  menuData: menuModel.menuData,
+  breadcrumbNameMap: menuModel.breadcrumbNameMap,
+  ...setting,
+}))(props => (
+  <Media query="(max-width: 599px)">
+    {isMobile => <BasicLayout {...props} isMobile={isMobile} />}
+  </Media>
+));
